@@ -1,0 +1,11 @@
+# MT5 Trade Copier - Project Dependencies
+# Install: pip install -r requirements.txt
+
+# Core: MetaTrader 5 Python API (required for mt5_connect.py, Mt5ConnectOpeningStable.py, test.py)
+MetaTrader5>=5.0.45
+
+# Core: CSV symbol mapping (required for mt5_connect.py, Mt5ConnectOpeningStable.py)
+pandas>=2.0.0
+
+# Optional - Integration/subscription checker (Integration/subscription_checker.py, example_integration.py)
+requests>=2.31.0

@@ -2,22 +2,56 @@ import MetaTrader5 as mt5
 import time
 import pandas as pd
 
-# Master Account (Source)
-MASTER_LOGIN = 1610001136
-MASTER_PASSWORD = "cd66k^PU"
-MASTER_SERVER = "STARTRADERINTL-Demo"
-
-# Slave Account (Destination)
-SLAVE_LOGIN = 203188600
-SLAVE_PASSWORD = "Srinivasam9$"
-SLAVE_SERVER = "Exness-MT5Trial7"
-
-# CSV File Path
+# CSV File Paths
+CREDENTIALS_FILE = "credentials.csv"
 CSV_FILE = "symbol_mapping.csv"
+
+# Credentials (loaded from CSV in load_credentials())
+MASTER_LOGIN = None
+MASTER_PASSWORD = None
+MASTER_SERVER = None
+SLAVE_LOGIN = None
+SLAVE_PASSWORD = None
+SLAVE_SERVER = None
+
+
+def load_credentials(csv_file=CREDENTIALS_FILE):
+    """Load Master and Slave credentials from CSV. Expected columns: Title, Value.
+    Required titles: master_login, master_password, master_server, slave_login, slave_password, slave_server
+    """
+    global MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER
+    global SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER
+    try:
+        df = pd.read_csv(csv_file)
+        if "Title" not in df.columns or "Value" not in df.columns:
+            print(f"❌ {csv_file} must contain 'Title' and 'Value' columns.")
+            return False
+        cred = df.set_index("Title")["Value"].to_dict()
+        required = [
+            "master_login", "master_password", "master_server",
+            "slave_login", "slave_password", "slave_server"
+        ]
+        missing = [k for k in required if k not in cred]
+        if missing:
+            print(f"❌ {csv_file} missing titles: {', '.join(missing)}")
+            return False
+        MASTER_LOGIN = int(cred["master_login"])
+        MASTER_PASSWORD = str(cred["master_password"]).strip()
+        MASTER_SERVER = str(cred["master_server"]).strip()
+        SLAVE_LOGIN = int(cred["slave_login"])
+        SLAVE_PASSWORD = str(cred["slave_password"]).strip()
+        SLAVE_SERVER = str(cred["slave_server"]).strip()
+        return True
+    except Exception as e:
+        print(f"❌ Error reading credentials from {csv_file}: {e}")
+        return False
 
 # Store existing trade IDs and mappings
 existing_trades = set()
 order_mapping = {}  # Master Ticket → Slave Ticket mapping
+
+# Cache for per-symbol successful filling modes to avoid repeated trial-and-error
+symbol_filling_cache = {}  # symbol -> mt5.ORDER_FILLING_*
 
 
 # Function to read CSV and create a symbol mapping dictionary
@@ -45,6 +79,30 @@ def connect_mt5(login, password, server):
         return False
     print(f"✅ Connected to account {login}")
     return True
+
+
+def get_supported_filling_mode(symbol: str):
+    """
+    Return an order filling mode supported by the broker for this symbol.
+    This avoids 'Unsupported filling mode' errors.
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        # Fallback to RETURN if symbol info is not available
+        return mt5.ORDER_FILLING_RETURN
+
+    # In the MT5 Python API, symbol.filling_mode is an int that should be
+    # compared against ORDER_FILLING_* constants, not SYMBOL_FILLING_*.
+    mode = info.filling_mode
+    if mode == mt5.ORDER_FILLING_FOK:
+        return mt5.ORDER_FILLING_FOK
+    if mode == mt5.ORDER_FILLING_IOC:
+        return mt5.ORDER_FILLING_IOC
+    if mode == mt5.ORDER_FILLING_RETURN:
+        return mt5.ORDER_FILLING_RETURN
+
+    # Default fallback
+    return mt5.ORDER_FILLING_RETURN
 
 
 # Function to get open trades from Master account
@@ -111,6 +169,13 @@ def copy_trades(symbol_mapping):
         order_type = mt5.ORDER_TYPE_BUY if trade_type == 0 else mt5.ORDER_TYPE_SELL
         price = mt5.symbol_info_tick(slave_symbol).bid if trade_type == 0 else mt5.symbol_info_tick(slave_symbol).ask
 
+
+        if price == None or price>0:
+            price = mt5.symbol_info_tick(slave_symbol).bid if trade_type == 0 else mt5.symbol_info_tick(
+                slave_symbol).ask
+
+        # print("price: ",price)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": slave_symbol,
@@ -119,19 +184,125 @@ def copy_trades(symbol_mapping):
             "price": price,
             "sl": sl,
             "tp": tp,
-            "deviation": 20,
+            "deviation": 120,
             "magic": 123456,
             "comment": "Copied Trade",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        result = mt5.order_send(request)
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            slave_ticket = result.order
+        # If we already discovered a working filling mode for this symbol,
+        # use it directly for speed.
+        global symbol_filling_cache
+        cached_mode = symbol_filling_cache.get(slave_symbol)
+
+        filling_names = {
+            mt5.ORDER_FILLING_FOK: "FOK",
+            mt5.ORDER_FILLING_IOC: "IOC",
+            mt5.ORDER_FILLING_RETURN: "RETURN",
+        }
+
+        def log_success(mode_used, result_obj, latency_ms):
+            mode_name = filling_names.get(mode_used, str(mode_used))
+            slave_ticket = result_obj.order
             order_mapping[trade.ticket] = slave_ticket  # Store ticket mapping
-            print(f"✅ Copied {master_symbol} → {slave_symbol} (Master Lot: {master_lot}, Slave Lot: {slave_lot})")
+            print(
+                f"✅ Copied {master_symbol} → {slave_symbol} "
+                f"(Master Lot: {master_lot}, Slave Lot: {slave_lot}) "
+                f"using filling mode {mode_name} "
+                f"in {latency_ms:.1f} ms"
+            )
+            try:
+                with open("orderlog.txt", "a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"MASTER_TICKET={trade.ticket} | SLAVE_TICKET={slave_ticket} | "
+                        f"{master_symbol}->{slave_symbol} | "
+                        f"MASTER_LOT={master_lot} | SLAVE_LOT={slave_lot} | "
+                        f"TYPE={'BUY' if trade_type == 0 else 'SELL'} | "
+                        f"PRICE={price} | SL={sl} | TP={tp} | "
+                        f"FILLING={mode_name} | "
+                        f"LATENCY_MS={latency_ms:.1f}\n"
+                    )
+            except Exception as log_err:
+                print(f"⚠️ Failed to write to orderlog.txt: {log_err}")
             existing_trades.add(trade.ticket)
+
+        # 1) Fast path: try cached mode once
+        if cached_mode is not None:
+            request["type_filling"] = cached_mode
+            start_time = time.time()
+            result = mt5.order_send(request)
+            latency_ms = (time.time() - start_time) * 1000.0
+            mode_name = filling_names.get(cached_mode, str(cached_mode))
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                log_success(cached_mode, result, latency_ms)
+                # Cache already correct; nothing else to do
+                continue
+
+            # If cached mode became invalid, drop from cache and fall back to full strategy
+            if result.retcode == getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030):
+                print(
+                    f"❌ Cached filling mode {mode_name} is now unsupported for {slave_symbol}. "
+                    f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+                )
+                symbol_filling_cache.pop(slave_symbol, None)
+            else:
+                print(
+                    f"❌ Failed to copy {master_symbol} → {slave_symbol} with cached filling {mode_name}. "
+                    f"(Master Lot: {master_lot}, Slave Lot: {slave_lot}). "
+                    f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+                )
+                continue  # don't try other modes for non-fill errors
+
+        # 2) Discovery path: try multiple filling modes so we learn which one works.
+        # Start with IOC to minimize latency on this server, then try others.
+        filling_candidates = []
+        for mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
+            if mode not in filling_candidates:
+                filling_candidates.append(mode)
+
+        last_result = None
+        copied = False
+
+        for mode in filling_candidates:
+            request["type_filling"] = mode
+            start_time = time.time()
+            result = mt5.order_send(request)
+            latency_ms = (time.time() - start_time) * 1000.0
+            last_result = result
+            mode_name = filling_names.get(mode, str(mode))
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                # Save working mode in cache for next orders of this symbol
+                symbol_filling_cache[slave_symbol] = mode
+                log_success(mode, result, latency_ms)
+                copied = True
+                break
+
+            # If filling mode is unsupported, try the next one
+            if result.retcode == getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030):
+                print(
+                    f"❌ Filling mode {mode_name} unsupported for {slave_symbol}. "
+                    f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+                )
+                continue
+
+            # For any other error, stop trying further modes
+            print(
+                f"❌ Failed to copy {master_symbol} → {slave_symbol} with filling {mode_name}. "
+                f"(Master Lot: {master_lot}, Slave Lot: {slave_lot}). "
+                f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+            )
+            break
+
+        if not copied and last_result is not None:
+            print(
+                f"❌ Failed to copy {master_symbol} → {slave_symbol} after trying all filling modes. "
+                f"(Master Lot: {master_lot}, Slave Lot: {slave_lot}). "
+                f"Last retcode: {last_result.retcode}, "
+                f"Comment: {getattr(last_result, 'comment', '')}"
+            )
 
     connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)  # Switch back to Master
 
@@ -228,18 +399,110 @@ def sync_closures():
             "volume": volume,  # Ensure correct volume
             "type": mt5.ORDER_TYPE_SELL if trade_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,  # Close opposite order
             "price": mt5.symbol_info_tick(symbol).bid if trade_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).ask,
-            "deviation": 10,
+            "deviation": 35,
             "magic": 123456,
             "comment": "Closed by Copier",
+            "type_time": mt5.ORDER_TIME_GTC,
         }
 
-        result = mt5.order_send(request)
+        # Reuse the same per-symbol filling cache as for opening trades
+        global symbol_filling_cache
+        cached_mode = symbol_filling_cache.get(symbol)
 
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"✅ Closed Slave Ticket {slave_ticket} (corresponding to Master Ticket {master_ticket})")
+        filling_names = {
+            mt5.ORDER_FILLING_FOK: "FOK",
+            mt5.ORDER_FILLING_IOC: "IOC",
+            mt5.ORDER_FILLING_RETURN: "RETURN",
+        }
+
+        def log_close_success(mode_used, result_obj, latency_ms):
+            mode_name = filling_names.get(mode_used, str(mode_used))
+            print(
+                f"✅ Closed Slave Ticket {slave_ticket} (Master Ticket {master_ticket}) "
+                f"using filling mode {mode_name} "
+                f"in {latency_ms:.1f} ms"
+            )
+            try:
+                with open("orderlog.txt", "a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"CLOSE | MASTER_TICKET={master_ticket} | SLAVE_TICKET={slave_ticket} | "
+                        f"SYMBOL={symbol} | VOLUME={volume} | "
+                        f"TYPE={'BUY' if trade_type == mt5.ORDER_TYPE_BUY else 'SELL'} | "
+                        f"FILLING={mode_name} | "
+                        f"LATENCY_MS={latency_ms:.1f}\n"
+                    )
+            except Exception as log_err:
+                print(f"⚠️ Failed to write close to orderlog.txt: {log_err}")
             del order_mapping[master_ticket]  # Remove from tracking
-        else:
-            print(f"❌ ERROR: Failed to close Slave Ticket {slave_ticket}. Reason: {result.comment}")
+
+        # 1) Fast path: try cached filling mode if we already know it works
+        if cached_mode is not None:
+            request["type_filling"] = cached_mode
+            start_time = time.time()
+            result = mt5.order_send(request)
+            latency_ms = (time.time() - start_time) * 1000.0
+            mode_name = filling_names.get(cached_mode, str(cached_mode))
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                log_close_success(cached_mode, result, latency_ms)
+                continue
+
+            if result.retcode == getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030):
+                print(
+                    f"❌ Cached filling mode {mode_name} is now unsupported for closing {symbol}. "
+                    f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+                )
+                symbol_filling_cache.pop(symbol, None)
+            else:
+                print(
+                    f"❌ ERROR: Failed to close Slave Ticket {slave_ticket} with cached filling {mode_name}. "
+                    f"Reason: {result.comment}"
+                )
+                continue
+
+        # 2) Discovery path: try multiple filling modes to close the trade.
+        # Start with IOC to minimize latency on this server, then try others.
+        filling_candidates = []
+        for mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
+            if mode not in filling_candidates:
+                filling_candidates.append(mode)
+
+        last_result = None
+        closed = False
+
+        for mode in filling_candidates:
+            request["type_filling"] = mode
+            start_time = time.time()
+            result = mt5.order_send(request)
+            latency_ms = (time.time() - start_time) * 1000.0
+            last_result = result
+            mode_name = filling_names.get(mode, str(mode))
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                symbol_filling_cache[symbol] = mode
+                log_close_success(mode, result, latency_ms)
+                closed = True
+                break
+
+            if result.retcode == getattr(mt5, "TRADE_RETCODE_INVALID_FILL", 10030):
+                print(
+                    f"❌ Filling mode {mode_name} unsupported for closing {symbol}. "
+                    f"Retcode: {result.retcode}, Comment: {getattr(result, 'comment', '')}"
+                )
+                continue
+
+            print(
+                f"❌ ERROR: Failed to close Slave Ticket {slave_ticket} with filling {mode_name}. "
+                f"Reason: {result.comment}"
+            )
+            break
+
+        if not closed and last_result is not None:
+            print(
+                f"❌ ERROR: Failed to close Slave Ticket {slave_ticket} after trying all filling modes. "
+                f"Last retcode: {last_result.retcode}, Comment: {getattr(last_result, 'comment', '')}"
+            )
 
     connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)  # Switch back to Master
 
@@ -248,6 +511,10 @@ def sync_closures():
 
 # Main function to run the trade copier
 def trade_copier():
+    if not load_credentials():
+        print("❌ Failed to load credentials. Exiting.")
+        return
+
     symbol_mapping = load_symbol_mapping(CSV_FILE)
     if not symbol_mapping:
         print("❌ No symbol mapping found. Exiting.")

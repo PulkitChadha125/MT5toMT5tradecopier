@@ -1,0 +1,1 @@
+pyinstaller --onefile --console mt5_connect.py

@@ -1,0 +1,3 @@
+slave_login,36091972
+slave_password,Ankit@414
+slave_server,LongAsiaGroup-Live

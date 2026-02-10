@@ -105,7 +105,7 @@ def copy_trades(symbol_mapping, master_trades):
             "price": price,
             "sl": sl,
             "tp": tp,
-            "deviation": 20,
+            "deviation": 120,
             "magic": 123456,
             "comment": "Copied Trade",
             "type_time": mt5.ORDER_TIME_GTC,
