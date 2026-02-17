@@ -14,6 +14,13 @@ SLAVE_LOGIN = None
 SLAVE_PASSWORD = None
 SLAVE_SERVER = None
 
+# Track whether MT5 terminal has been initialized.
+# We initialize once and then only use mt5.login() to switch accounts,
+# instead of doing shutdown/initialize on every switch.
+mt5_initialized = False
+# Current MT5 login (account id). Skip mt5.login() if already on this account.
+_current_login = None
+
 
 def load_credentials(csv_file=CREDENTIALS_FILE):
     """Load Master and Slave credentials from CSV. Expected columns: Title, Value.
@@ -70,13 +77,29 @@ def load_symbol_mapping(csv_file):
 
 # Function to connect to an MT5 account
 def connect_mt5(login, password, server):
-    mt5.shutdown()
-    if not mt5.initialize():
-        print(f"❌ Failed to initialize MT5: {mt5.last_error()}")
-        return False
+    """
+    Ensure MT5 is initialized once, then log in to the requested account.
+    Skips mt5.login() if already on this account to avoid redundant round-trips.
+    """
+    global mt5_initialized, _current_login
+
+    # Initialize terminal once
+    if not mt5_initialized:
+        if not mt5.initialize():
+            print(f"❌ Failed to initialize MT5: {mt5.last_error()}")
+            return False
+        mt5_initialized = True
+
+    # Skip login if already on this account
+    if _current_login == login:
+        return True
+
+    # Switch login to the requested account
     if not mt5.login(login, password, server):
         print(f"❌ Failed to login to account {login}: {mt5.last_error()}")
         return False
+
+    _current_login = login
     print(f"✅ Connected to account {login}")
     return True
 
@@ -119,22 +142,9 @@ def record_existing_trades():
     print(f"ℹ️ Ignoring {len(existing_trades)} existing trades.")
 
 
-# Function to copy new trades to Slave account
-# Function to copy new trades to Slave account
-def copy_trades(symbol_mapping):
-    global existing_trades, order_mapping
-
-    master_trades = get_master_trades()
-    new_trades = [trade for trade in master_trades if trade.ticket not in existing_trades]
-
-    if not new_trades:
-        return  # No new trades, stay in Master account
-
-    print("🔍 New trades detected! Switching to Slave account to copy trades...")
-
-    if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
-        print("❌ ERROR: Failed to switch to Slave account.")
-        return
+# Run copy logic on Slave (caller must be on Slave account).
+def _do_copy_trades(new_trades, symbol_mapping):
+    global existing_trades, order_mapping, symbol_filling_cache
 
     for trade in new_trades:
         master_symbol = trade.symbol
@@ -304,77 +314,84 @@ def copy_trades(symbol_mapping):
                 f"Comment: {getattr(last_result, 'comment', '')}"
             )
 
-    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)  # Switch back to Master
 
-
-
-# Function to sync SL/TP modifications
-def sync_modifications():
-    global order_mapping
+# Function to copy new trades to Slave account (switches to Slave, runs _do_copy_trades, switches back).
+def copy_trades(symbol_mapping):
+    global existing_trades, order_mapping
 
     master_trades = get_master_trades()
-    changes = False  # Track if modifications were detected
+    new_trades = [trade for trade in master_trades if trade.ticket not in existing_trades]
 
-    for trade in master_trades:
-        if trade.ticket not in order_mapping:
-            continue  # Only update mapped trades
+    if not new_trades:
+        return
 
-        slave_ticket = order_mapping[trade.ticket]
-
-        slave_trade = mt5.positions_get(ticket=slave_ticket)
-        if not slave_trade:
-            continue  # Trade not found in Slave, skip
-
-        slave_trade = slave_trade[0]
-        if slave_trade.sl != trade.sl or slave_trade.tp != trade.tp:
-            changes = True  # Changes detected
-            break
-
-    if not changes:
-        return  # No changes, stay in Master account
-
-    print("🔍 Trade modification detected! Switching to Slave account...")
-
+    print("🔍 New trades detected! Switching to Slave account to copy trades...")
     if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
         print("❌ ERROR: Failed to switch to Slave account.")
         return
+    _do_copy_trades(new_trades, symbol_mapping)
+    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)
+
+
+# Run SL/TP sync on Slave (caller must be on Slave account).
+def _do_sync_modifications(master_trades):
+    global order_mapping
 
     for trade in master_trades:
         if trade.ticket not in order_mapping:
             continue
 
         slave_ticket = order_mapping[trade.ticket]
+        slave_trade = mt5.positions_get(ticket=slave_ticket)
+        if not slave_trade:
+            continue
+        slave_trade = slave_trade[0]
+        if slave_trade.sl == trade.sl and slave_trade.tp == trade.tp:
+            continue
+
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": slave_ticket,
             "sl": trade.sl,
             "tp": trade.tp,
         }
-
         result = mt5.order_send(request)
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             print(f"✅ Updated SL/TP for Master Ticket {trade.ticket} → Slave Ticket {slave_ticket}")
 
-    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)  # Switch back to Master
 
-
-# Function to close trades in Slave when closed in Master
-# Function to close trades in Slave when closed in Master
-# Function to close trades in Slave when closed in Master
-def sync_closures():
+# Function to sync SL/TP modifications (switches to Slave, runs _do_sync_modifications, switches back).
+def sync_modifications():
     global order_mapping
 
-    master_tickets = {trade.ticket for trade in get_master_trades()}
-    to_close = [ticket for ticket in order_mapping if ticket not in master_tickets]
+    master_trades = get_master_trades()
+    changes = False
+    for trade in master_trades:
+        if trade.ticket not in order_mapping:
+            continue
+        slave_ticket = order_mapping[trade.ticket]
+        slave_trade = mt5.positions_get(ticket=slave_ticket)
+        if not slave_trade:
+            continue
+        slave_trade = slave_trade[0]
+        if slave_trade.sl != trade.sl or slave_trade.tp != trade.tp:
+            changes = True
+            break
 
-    if not to_close:
-        return  # No closures detected, stay in Master account
+    if not changes:
+        return
 
-    print("🔍 Trade closure detected! Switching to Slave account...")
-
+    print("🔍 Trade modification detected! Switching to Slave account...")
     if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
         print("❌ ERROR: Failed to switch to Slave account.")
         return
+    _do_sync_modifications(master_trades)
+    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)
+
+
+# Run close logic on Slave (caller must be on Slave account).
+def _do_sync_closures(to_close):
+    global order_mapping, symbol_filling_cache
 
     for master_ticket in to_close:
         slave_ticket = order_mapping[master_ticket]
@@ -504,9 +521,23 @@ def sync_closures():
                 f"Last retcode: {last_result.retcode}, Comment: {getattr(last_result, 'comment', '')}"
             )
 
-    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)  # Switch back to Master
 
+# Function to close trades in Slave when closed in Master (switches to Slave, runs _do_sync_closures, switches back).
+def sync_closures():
+    global order_mapping
 
+    master_tickets = {trade.ticket for trade in get_master_trades()}
+    to_close = [ticket for ticket in order_mapping if ticket not in master_tickets]
+
+    if not to_close:
+        return
+
+    print("🔍 Trade closure detected! Switching to Slave account...")
+    if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
+        print("❌ ERROR: Failed to switch to Slave account.")
+        return
+    _do_sync_closures(to_close)
+    connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)
 
 
 # Main function to run the trade copier
@@ -520,17 +551,38 @@ def trade_copier():
         print("❌ No symbol mapping found. Exiting.")
         return
 
+    # Initialize MT5 and validate both accounts.
+    # Login to Slave first, then Master so we end up on the Master account.
+    if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
+        return
     if not connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER):
         return
+
     record_existing_trades()
 
     print("📡 Monitoring for new trades, modifications, and closures...")
+    print("💡 Using batched slave switch: one login to slave per loop when there is work.")
 
     while True:
-        copy_trades(symbol_mapping)
-        sync_modifications()
-        sync_closures()
-        time.sleep(5)
+        master_trades = get_master_trades()
+        new_trades = [t for t in master_trades if t.ticket not in existing_trades]
+        master_tickets = {t.ticket for t in master_trades}
+        to_close = [t for t in order_mapping if t not in master_tickets]
+
+        if new_trades or to_close:
+            if not connect_mt5(SLAVE_LOGIN, SLAVE_PASSWORD, SLAVE_SERVER):
+                print("❌ ERROR: Failed to switch to Slave account.")
+            else:
+                if new_trades:
+                    print("🔍 New trades detected! Copying on Slave...")
+                    _do_copy_trades(new_trades, symbol_mapping)
+                _do_sync_modifications(master_trades)
+                if to_close:
+                    print("🔍 Closures detected! Closing on Slave...")
+                    _do_sync_closures(to_close)
+                connect_mt5(MASTER_LOGIN, MASTER_PASSWORD, MASTER_SERVER)
+
+        time.sleep(0.3)
 
 
 # Run the trade copier

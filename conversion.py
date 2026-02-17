@@ -10,7 +10,7 @@ def convert_watchlist():
     Read symbols from watchlist.csv and write them to
     watchlist_converted.csv with two columns:
       - master_symbol: original symbol from the file
-      - slave_symbol:  left part before '.' + '-STD'
+      - slave_symbol:  left part before '.' (no suffix)
 
     The input file is a UTF-16 encoded, semicolon-separated text file
     where the first column contains the symbol (header: Symbol).
@@ -37,9 +37,8 @@ def convert_watchlist():
                 if not master_symbol:
                     continue
 
-                # Take part before '.', then add '-STD'
-                base = master_symbol.split(".")[0]
-                slave_symbol = f"{base}-STD"
+                # Take part before '.' as slave symbol (no suffix)
+                slave_symbol = master_symbol.split(".")[0]
 
                 rows.append((master_symbol, slave_symbol))
 
